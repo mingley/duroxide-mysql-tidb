@@ -149,6 +149,15 @@ DUROXIDE_MYSQL_TEST_URL="mysql://root@127.0.0.1:34000/duroxide_test" \
 cargo test --all-features -- --test-threads=6
 ```
 
+## Releasing
+
+Releases are published automatically to crates.io and GitHub Releases by [`.github/workflows/release.yml`](.github/workflows/release.yml) whenever a `v*.*.*` tag is pushed (after passing lint, unit/doc tests, `cargo package --locked`, and live MySQL 8.0 + TiDB conformance):
+
+```bash
+# Update CHANGELOG.md, then bump version, verify, commit, tag, and push:
+./scripts/release.sh 0.1.1 --push
+```
+
 ## License
 
 Licensed under either of:

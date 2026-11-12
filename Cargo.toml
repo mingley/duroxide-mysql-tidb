@@ -1,6 +1,7 @@
 [package]
 name = "duroxide-mysql-tidb"
 version = "0.1.0"
+authors = ["mingley"]
 edition = "2024"
 rust-version = "1.94"
 description = "MySQL 8.0+ and TiDB storage provider for Duroxide durable execution"
@@ -10,8 +11,17 @@ homepage = "https://github.com/mingley/duroxide-mysql-tidb"
 documentation = "https://docs.rs/duroxide-mysql-tidb"
 readme = "README.md"
 publish = true
+exclude = [
+    ".github/",
+    "scripts/",
+    "tests/",
+]
 keywords = ["duroxide", "mysql", "tidb", "workflow", "durable-execution"]
 categories = ["database", "asynchronous", "concurrency"]
+
+[package.metadata.docs.rs]
+features = ["tls-rustls-ring", "mysql-rsa"]
+rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = ["tls-rustls-ring", "mysql-rsa"]
