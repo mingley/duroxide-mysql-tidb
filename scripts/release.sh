@@ -62,9 +62,11 @@ fi
 
 echo "Running pre-release verification..."
 cargo fmt --all -- --check
+cargo check --no-default-features --features memory
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --lib
-cargo test --doc
+cargo test --lib --all-features
+cargo test --doc --all-features
+cargo test --test memory_provider_validations --all-features
 cargo package --allow-dirty
 
 if [[ -n "$(git status --porcelain Cargo.toml Cargo.lock)" ]]; then

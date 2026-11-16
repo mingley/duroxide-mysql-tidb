@@ -15,6 +15,8 @@
 //! - **External migration friendly** — supports automatic `CREATE TABLE IF NOT EXISTS` at
 //!   startup (`auto_migrate(true)`, default) or pre-provisioned schemas (`auto_migrate(false)`)
 //!   using [`schema_ddl`] / `sql/0001_init.sql`.
+//! - **Optional pure-Rust in-memory provider (`memory` feature)** — enables `MemoryProvider`
+//!   for fast, zero-C unit and integration tests without an external database.
 //!
 //! # Quick Start
 //!
@@ -56,12 +58,16 @@ mod admin;
 pub mod config;
 pub mod error;
 mod id;
+#[cfg(feature = "memory")]
+pub mod memory;
 mod provider;
 pub mod schema;
 
 pub use config::{DEFAULT_CANDIDATE_BATCH_SIZE, DEFAULT_MAX_CONNECTIONS, MysqlProviderConfig};
 pub use duroxide;
 pub use error::{InitError, SqlErrorClass, classify_mysql_code};
+#[cfg(feature = "memory")]
+pub use memory::MemoryProvider;
 pub use provider::MysqlProvider;
 pub use schema::{schema_ddl, schema_statements, validate_table_prefix};
 pub use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlSslMode};
