@@ -42,9 +42,11 @@ jobs:
           fi
 
       - run: cargo fmt --all -- --check
+      - run: cargo check --no-default-features --features memory
       - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test --lib
-      - run: cargo test --doc
+      - run: cargo test --lib --all-features
+      - run: cargo test --doc --all-features
+      - run: cargo test --test memory_provider_validations --all-features
       - run: cargo package --locked
 
       - name: Run MySQL 8.0 conformance
@@ -53,7 +55,7 @@ jobs:
           DUROXIDE_MYSQL_TEST_URL: mysql://root:testpass@127.0.0.1:3306/duroxide_test
         run: |
           mysql -h 127.0.0.1 -P 3306 -uroot -ptestpass -e "SET GLOBAL max_connections = 500;"
-          cargo test --all-features -- --test-threads=6
+          cargo test --all-features --test provider_validations --test runtime_scenarios -- --test-threads=6
 
       - name: Run TiDB conformance
         env:
@@ -67,7 +69,7 @@ jobs:
             fi
             sleep 1
           done
-          cargo test --all-features -- --test-threads=6
+          cargo test --all-features --test provider_validations --test runtime_scenarios -- --test-threads=6
 
   publish:
     name: Publish to crates.io & GitHub Release

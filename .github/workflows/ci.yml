@@ -19,9 +19,11 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
+      - run: cargo check --no-default-features --features memory
       - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test --lib
-      - run: cargo test --doc
+      - run: cargo test --lib --all-features
+      - run: cargo test --doc --all-features
+      - run: cargo test --test memory_provider_validations --all-features
 
   mysql-conformance:
     name: MySQL 8.0 Conformance
@@ -49,7 +51,7 @@ jobs:
         env:
           DUROXIDE_MYSQL_REQUIRE_DB: "1"
           DUROXIDE_MYSQL_TEST_URL: mysql://root:testpass@127.0.0.1:3306/duroxide_test
-        run: cargo test --all-features -- --test-threads=6
+        run: cargo test --all-features --test provider_validations --test runtime_scenarios -- --test-threads=6
 
   tidb-conformance:
     name: TiDB Conformance
@@ -72,4 +74,4 @@ jobs:
         env:
           DUROXIDE_MYSQL_REQUIRE_DB: "1"
           DUROXIDE_MYSQL_TEST_URL: mysql://root@127.0.0.1:4000/duroxide_test
-        run: cargo test --all-features -- --test-threads=6
+        run: cargo test --all-features --test provider_validations --test runtime_scenarios -- --test-threads=6

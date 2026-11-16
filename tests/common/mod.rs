@@ -123,8 +123,12 @@ impl IsolatedMysqlTestFactory {
 
     pub async fn finish(self) {
         let prefixes = self.leased_prefixes.into_inner();
-        self.pool.close().await;
-        release_prefixes(prefixes);
+        if tokio::time::timeout(Duration::from_secs(5), self.pool.close())
+            .await
+            .is_ok()
+        {
+            release_prefixes(prefixes);
+        }
     }
 }
 
@@ -166,8 +170,13 @@ impl SharedMysqlTestFactory {
     }
 
     pub async fn finish(self) {
-        self.pool.close().await;
-        release_prefixes(vec![self.prefix]);
+        let prefix = self.prefix;
+        if tokio::time::timeout(Duration::from_secs(5), self.pool.close())
+            .await
+            .is_ok()
+        {
+            release_prefixes(vec![prefix]);
+        }
     }
 }
 

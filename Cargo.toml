@@ -20,7 +20,7 @@ keywords = ["duroxide", "mysql", "tidb", "workflow", "durable-execution"]
 categories = ["database", "asynchronous", "concurrency"]
 
 [package.metadata.docs.rs]
-features = ["tls-rustls-ring", "mysql-rsa"]
+features = ["tls-rustls-ring", "mysql-rsa", "memory"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
@@ -29,6 +29,7 @@ tls-rustls-ring = ["sqlx/tls-rustls-ring"]
 tls-rustls-aws-lc-rs = ["sqlx/tls-rustls-aws-lc-rs"]
 tls-native = ["sqlx/tls-native-tls"]
 mysql-rsa = ["sqlx/mysql-rsa"]
+memory = []
 replay-version-test = ["duroxide/replay-version-test"]
 
 [dependencies]
