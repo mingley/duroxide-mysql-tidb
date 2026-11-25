@@ -1,6 +1,8 @@
 //! Core [`duroxide::providers::Provider`] implementation for MySQL 8.0+ and TiDB.
 
 use std::collections::HashMap;
+use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use duroxide::providers::{
@@ -22,15 +24,72 @@ use crate::schema::{SchemaNames, run_migrations};
 
 const MAX_TX_RETRIES: usize = 4;
 
+/// Resolves a live [`MySqlPool`] for each storage operation performed by [`MysqlProvider`].
+///
+/// Implement this trait—or pass a closure to [`MysqlProvider::from_pool_fn`]—when an external
+/// connection manager owns DNS SRV discovery, proxy failover, or TLS/credential rotation across
+/// multiple [`MySqlPool`] instances.
+pub trait PoolResolver: Send + Sync + 'static {
+    /// Returns a live [`MySqlPool`] to execute the next storage operation against.
+    ///
+    /// Returning `Err` surfaces as a retryable [`ProviderError`] so the Duroxide runtime backs off
+    /// and retries once a healthy pool becomes available.
+    fn resolve_pool(&self) -> Result<MySqlPool, String>;
+}
+
+impl PoolResolver for MySqlPool {
+    fn resolve_pool(&self) -> Result<MySqlPool, String> {
+        Ok(self.clone())
+    }
+}
+
+/// Type-erased [`PoolResolver`] backed by a closure.
+///
+/// Created via [`FnPoolResolver::new`] or [`MysqlProvider::from_pool_fn`].
+#[derive(Clone)]
+pub struct FnPoolResolver {
+    resolver: Arc<dyn Fn() -> Result<MySqlPool, String> + Send + Sync>,
+}
+
+impl FnPoolResolver {
+    /// Wraps a `Fn() -> Result<MySqlPool, E>` closure as a [`PoolResolver`].
+    pub fn new<F, E>(resolver: F) -> Self
+    where
+        F: Fn() -> Result<MySqlPool, E> + Send + Sync + 'static,
+        E: fmt::Display,
+    {
+        Self {
+            resolver: Arc::new(move || resolver().map_err(|err| err.to_string())),
+        }
+    }
+}
+
+impl fmt::Debug for FnPoolResolver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("FnPoolResolver(..)")
+    }
+}
+
+impl PoolResolver for FnPoolResolver {
+    fn resolve_pool(&self) -> Result<MySqlPool, String> {
+        (self.resolver)()
+    }
+}
+
 /// MySQL 8.0+ and TiDB durable storage provider for [`duroxide`].
+///
+/// By default (`P = MySqlPool`), operations execute against a single `sqlx::MySqlPool`. For
+/// deployments behind external pool managers (DNS SRV discovery, proxy rotation, or rotating
+/// TLS/credentials), construct with [`MysqlProvider::from_pool_fn`] or
+/// [`MysqlProvider::from_pool_resolver`] so every storage operation resolves a live pool.
 #[derive(Debug, Clone)]
-pub struct MysqlProvider {
-    pub(crate) pool: MySqlPool,
+pub struct MysqlProvider<P = MySqlPool> {
+    pub(crate) pool: P,
     pub(crate) tables: SchemaNames,
     pub(crate) candidate_batch_size: u32,
 }
 
-impl MysqlProvider {
+impl MysqlProvider<MySqlPool> {
     /// Connects to a MySQL 8.0+ or TiDB database URL with default pool settings and runs
     /// `CREATE TABLE IF NOT EXISTS` schema initialization.
     ///
@@ -83,7 +142,7 @@ impl MysqlProvider {
             .connect_with(config.connect_options)
             .await?;
 
-        Self::from_pool_internal(
+        Self::from_resolver_internal(
             pool,
             tables,
             config.table_prefix,
@@ -103,35 +162,52 @@ impl MysqlProvider {
         table_prefix: &str,
         auto_migrate: bool,
     ) -> Result<Self, InitError> {
-        let tables = SchemaNames::new(table_prefix)?;
-        Self::from_pool_internal(pool, tables, table_prefix.to_string(), auto_migrate, 8).await
+        Self::from_pool_resolver(pool, table_prefix, auto_migrate).await
     }
 
-    async fn from_pool_internal(
-        pool: MySqlPool,
-        tables: SchemaNames,
-        prefix: String,
+    /// Wraps a dynamic pool-selection closure so each storage operation resolves a live
+    /// [`MySqlPool`] on demand instead of pinning a single startup pool.
+    ///
+    /// This avoids stale connections when an external connection manager rotates hosts via DNS SRV,
+    /// drains proxies, or rebuilds pools for TLS/credential reloads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InitError`] if `table_prefix` is invalid, or if `auto_migrate` is enabled and
+    /// resolving a pool or running DDL fails.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use std::sync::Arc;
+    /// use duroxide_mysql_tidb::{MySqlPool, MysqlProvider};
+    ///
+    /// # async fn example(get_pool: impl Fn() -> Result<MySqlPool, String> + Send + Sync + 'static)
+    /// # -> Result<(), Box<dyn std::error::Error>> {
+    /// let provider = Arc::new(
+    ///     MysqlProvider::from_pool_fn(get_pool, "app_", false).await?,
+    /// );
+    /// # let _ = provider;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn from_pool_fn<F, E>(
+        resolver: F,
+        table_prefix: &str,
         auto_migrate: bool,
-        candidate_batch_size: u32,
-    ) -> Result<Self, InitError> {
-        if auto_migrate {
-            run_migrations(&pool, &prefix).await?;
-        }
-        Ok(Self {
-            pool,
-            tables,
-            candidate_batch_size,
-        })
+    ) -> Result<MysqlProvider<FnPoolResolver>, InitError>
+    where
+        F: Fn() -> Result<MySqlPool, E> + Send + Sync + 'static,
+        E: fmt::Display,
+    {
+        MysqlProvider::from_pool_resolver(FnPoolResolver::new(resolver), table_prefix, auto_migrate)
+            .await
     }
 
     /// Returns a reference to the underlying `sqlx::MySqlPool`.
     #[must_use]
     pub fn pool(&self) -> &MySqlPool {
         &self.pool
-    }
-
-    fn generate_lock_token() -> String {
-        format!("lock_{}", uuid::Uuid::new_v4())
     }
 
     pub(crate) fn extract_orchestrator_instance(item: &WorkItem) -> Option<&str> {
@@ -154,6 +230,66 @@ impl MysqlProvider {
             } => Some(parent_instance.as_str()),
             WorkItem::ActivityExecute { .. } => None,
         }
+    }
+}
+
+impl<P: PoolResolver> MysqlProvider<P> {
+    /// Wraps a custom [`PoolResolver`] with optional `table_prefix` and `auto_migrate`.
+    ///
+    /// When `auto_migrate` is `true`, resolves a temporary pool once to run DDL migrations and
+    /// drops it immediately without retaining it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InitError`] if `table_prefix` is invalid, or if `auto_migrate` is enabled and
+    /// resolving a pool or running DDL fails.
+    pub async fn from_pool_resolver(
+        resolver: P,
+        table_prefix: &str,
+        auto_migrate: bool,
+    ) -> Result<Self, InitError> {
+        let tables = SchemaNames::new(table_prefix)?;
+        Self::from_resolver_internal(resolver, tables, table_prefix.to_string(), auto_migrate, 8)
+            .await
+    }
+
+    async fn from_resolver_internal(
+        resolver: P,
+        tables: SchemaNames,
+        prefix: String,
+        auto_migrate: bool,
+        candidate_batch_size: u32,
+    ) -> Result<Self, InitError> {
+        if auto_migrate {
+            let pool = resolver.resolve_pool().map_err(|err| {
+                InitError::InvalidConfig(format!("failed to resolve pool for migrations: {err}"))
+            })?;
+            run_migrations(&pool, &prefix).await?;
+        }
+        Ok(Self {
+            pool: resolver,
+            tables,
+            candidate_batch_size,
+        })
+    }
+
+    /// Resolves a live `sqlx::MySqlPool` from the configured [`PoolResolver`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the resolver's error message if no live pool is currently available.
+    pub fn resolve_pool(&self) -> Result<MySqlPool, String> {
+        self.pool.resolve_pool()
+    }
+
+    pub(crate) fn acquire_pool(&self, operation: &str) -> Result<MySqlPool, ProviderError> {
+        self.pool
+            .resolve_pool()
+            .map_err(|err| ProviderError::retryable(operation, err))
+    }
+
+    fn generate_lock_token() -> String {
+        format!("lock_{}", uuid::Uuid::new_v4())
     }
 
     fn event_type_name(kind: &EventKind) -> &'static str {
@@ -366,8 +502,8 @@ impl MysqlProvider {
         lock_timeout: Duration,
         version_bounds: Option<(i64, i64)>,
     ) -> Result<Option<(OrchestrationItem, String, u32)>, ProviderError> {
-        let mut tx = self
-            .pool
+        let pool = self.acquire_pool("fetch_orchestration_item")?;
+        let mut tx = pool
             .begin()
             .await
             .map_err(|e| sqlx_to_provider_error("fetch_orchestration_item", e))?;
@@ -710,13 +846,14 @@ impl MysqlProvider {
         operation: &str,
         lock_token: &str,
     ) -> Result<Option<String>, ProviderError> {
+        let pool = self.acquire_pool(operation)?;
         let sql = format!(
             "SELECT instance_id FROM {} WHERE lock_token = ? LIMIT 1",
             self.tables.instance_locks
         );
         let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(lock_token)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&pool)
             .await
             .map_err(|e| sqlx_to_provider_error(operation, e))?;
 
@@ -738,8 +875,8 @@ impl MysqlProvider {
         lock_timeout: Duration,
         session_cfg: Option<&SessionFetchConfig>,
     ) -> Result<Option<(WorkItem, String, u32)>, ProviderError> {
-        let mut tx = self
-            .pool
+        let pool = self.acquire_pool("fetch_work_item")?;
+        let mut tx = pool
             .begin()
             .await
             .map_err(|e| sqlx_to_provider_error("fetch_work_item", e))?;
@@ -889,7 +1026,7 @@ impl MysqlProvider {
 }
 
 #[async_trait::async_trait]
-impl Provider for MysqlProvider {
+impl<P: PoolResolver> Provider for MysqlProvider<P> {
     fn name(&self) -> &str {
         "mysql-tidb"
     }
@@ -913,6 +1050,7 @@ impl Provider for MysqlProvider {
             None
         };
 
+        let pool = self.acquire_pool("fetch_orchestration_item")?;
         let now_ms = now_millis();
         let batch_limit = self.candidate_batch_size;
 
@@ -944,7 +1082,7 @@ impl Provider for MysqlProvider {
                 .bind(min_packed)
                 .bind(max_packed)
                 .bind(batch_limit)
-                .fetch_all(&self.pool)
+                .fetch_all(&pool)
                 .await
                 .map_err(|e| sqlx_to_provider_error("fetch_orchestration_item", e))?;
             rows.iter()
@@ -966,7 +1104,7 @@ impl Provider for MysqlProvider {
                 .bind(now_ms)
                 .bind(now_ms)
                 .bind(batch_limit)
-                .fetch_all(&self.pool)
+                .fetch_all(&pool)
                 .await
                 .map_err(|e| sqlx_to_provider_error("fetch_orchestration_item", e))?;
             rows.iter()
@@ -1049,8 +1187,8 @@ impl Provider for MysqlProvider {
             ));
         };
 
-        let mut tx = self
-            .pool
+        let pool = self.acquire_pool("abandon_orchestration_item")?;
+        let mut tx = pool
             .begin()
             .await
             .map_err(|e| sqlx_to_provider_error("abandon_orchestration_item", e))?;
@@ -1178,8 +1316,8 @@ impl Provider for MysqlProvider {
             ));
         };
 
-        let mut tx = self
-            .pool
+        let pool = self.acquire_pool("renew_orchestration_item_lock")?;
+        let mut tx = pool
             .begin()
             .await
             .map_err(|e| sqlx_to_provider_error("renew_orchestration_item_lock", e))?;
@@ -1261,13 +1399,14 @@ impl Provider for MysqlProvider {
     }
 
     async fn read(&self, instance: &str) -> Result<Vec<Event>, ProviderError> {
+        let pool = self.acquire_pool("read")?;
         let exec_sql = format!(
             "SELECT COALESCE(MAX(execution_id), 1) FROM {} WHERE instance_id = ?",
             self.tables.executions
         );
         let exec_id: i64 = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(exec_sql.as_str()))
             .bind(instance)
-            .fetch_one(&self.pool)
+            .fetch_one(&pool)
             .await
             .map_err(|e| sqlx_to_provider_error("read", e))?;
 
@@ -1280,6 +1419,7 @@ impl Provider for MysqlProvider {
         instance: &str,
         execution_id: u64,
     ) -> Result<Vec<Event>, ProviderError> {
+        let pool = self.acquire_pool("read_with_execution")?;
         let sql = format!(
             "SELECT event_data FROM {} WHERE instance_id = ? AND execution_id = ? ORDER BY event_id ASC",
             self.tables.history
@@ -1287,7 +1427,7 @@ impl Provider for MysqlProvider {
         let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(instance)
             .bind(execution_id as i64)
-            .fetch_all(&self.pool)
+            .fetch_all(&pool)
             .await
             .map_err(|e| sqlx_to_provider_error("read_with_execution", e))?;
 
@@ -1316,8 +1456,8 @@ impl Provider for MysqlProvider {
         execution_id: u64,
         new_events: Vec<Event>,
     ) -> Result<(), ProviderError> {
-        let mut tx = self
-            .pool
+        let pool = self.acquire_pool("append_with_execution")?;
+        let mut tx = pool
             .begin()
             .await
             .map_err(|e| sqlx_to_provider_error("append_with_execution", e))?;
@@ -1336,7 +1476,7 @@ impl Provider for MysqlProvider {
         item: WorkItem,
         delay: Option<Duration>,
     ) -> Result<(), ProviderError> {
-        let Some(instance) = Self::extract_orchestrator_instance(&item) else {
+        let Some(instance) = MysqlProvider::extract_orchestrator_instance(&item) else {
             return Err(ProviderError::permanent(
                 "enqueue_for_orchestrator",
                 "Invalid work item type for orchestrator queue",
@@ -1350,6 +1490,7 @@ impl Provider for MysqlProvider {
             )
         })?;
 
+        let pool = self.acquire_pool("enqueue_for_orchestrator")?;
         let now_ms = now_millis();
         let visible_at = match (&item, delay) {
             (_, Some(d)) => offset_millis(now_ms, d),
@@ -1368,7 +1509,7 @@ impl Provider for MysqlProvider {
             .bind(raw)
             .bind(visible_at)
             .bind(now_ms)
-            .execute(&self.pool)
+            .execute(&pool)
             .await
             .map_err(|e| sqlx_to_provider_error("enqueue_for_orchestrator", e))?;
 
@@ -1397,6 +1538,7 @@ impl Provider for MysqlProvider {
         let raw = serde_json::to_string(&item).map_err(|e| {
             ProviderError::permanent("enqueue_for_worker", format!("Serialization error: {e}"))
         })?;
+        let pool = self.acquire_pool("enqueue_for_worker")?;
         let now_ms = now_millis();
         let id = next_seq_id();
 
@@ -1415,7 +1557,7 @@ impl Provider for MysqlProvider {
             .bind(activity_id)
             .bind(session_id)
             .bind(tag)
-            .execute(&self.pool)
+            .execute(&pool)
             .await
             .map_err(|e| sqlx_to_provider_error("enqueue_for_worker", e))?;
 
@@ -1433,6 +1575,7 @@ impl Provider for MysqlProvider {
             return Ok(None);
         }
 
+        let pool = self.acquire_pool("fetch_work_item")?;
         let now_ms = now_millis();
         let (tag_clause, tag_values) = Self::build_tag_clause(tag_filter);
         let batch_limit = self.candidate_batch_size;
@@ -1460,7 +1603,7 @@ impl Provider for MysqlProvider {
             }
             query = query.bind(batch_limit);
             query
-                .fetch_all(&self.pool)
+                .fetch_all(&pool)
                 .await
                 .map_err(|e| sqlx_to_provider_error("fetch_work_item", e))?
         } else {
@@ -1483,7 +1626,7 @@ impl Provider for MysqlProvider {
             }
             query = query.bind(batch_limit);
             query
-                .fetch_all(&self.pool)
+                .fetch_all(&pool)
                 .await
                 .map_err(|e| sqlx_to_provider_error("fetch_work_item", e))?
         };
@@ -1509,8 +1652,8 @@ impl Provider for MysqlProvider {
         token: &str,
         completion: Option<WorkItem>,
     ) -> Result<(), ProviderError> {
-        let mut tx = self
-            .pool
+        let pool = self.acquire_pool("ack_work_item")?;
+        let mut tx = pool
             .begin()
             .await
             .map_err(|e| sqlx_to_provider_error("ack_work_item", e))?;
@@ -1613,7 +1756,7 @@ impl Provider for MysqlProvider {
                 .bind(now_ms)
                 .bind(&sid)
                 .bind(now_ms)
-                .execute(&self.pool)
+                .execute(&pool)
                 .await;
         }
 
@@ -1625,13 +1768,14 @@ impl Provider for MysqlProvider {
         token: &str,
         extend_for: Duration,
     ) -> Result<(), ProviderError> {
+        let pool = self.acquire_pool("renew_work_item_lock")?;
         let find_sql = format!(
             "SELECT id, session_id, locked_until FROM {} WHERE lock_token = ? LIMIT 1",
             self.tables.worker_queue
         );
         let row = sqlx::query(sqlx::AssertSqlSafe(find_sql.as_str()))
             .bind(token)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&pool)
             .await
             .map_err(|e| sqlx_to_provider_error("renew_work_item_lock", e))?;
 
@@ -1670,7 +1814,7 @@ impl Provider for MysqlProvider {
             .bind(id)
             .bind(token)
             .bind(now_ms)
-            .execute(&self.pool)
+            .execute(&pool)
             .await
             .map_err(|e| sqlx_to_provider_error("renew_work_item_lock", e))?;
 
@@ -1690,7 +1834,7 @@ impl Provider for MysqlProvider {
                 .bind(now_ms)
                 .bind(&sid)
                 .bind(now_ms)
-                .execute(&self.pool)
+                .execute(&pool)
                 .await;
         }
 
@@ -1724,10 +1868,11 @@ impl Provider for MysqlProvider {
             )
         };
 
+        let pool = self.acquire_pool("abandon_work_item")?;
         let res = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(visible_at)
             .bind(token)
-            .execute(&self.pool)
+            .execute(&pool)
             .await
             .map_err(|e| sqlx_to_provider_error("abandon_work_item", e))?;
 
@@ -1751,6 +1896,7 @@ impl Provider for MysqlProvider {
             return Ok(0);
         }
 
+        let pool = self.acquire_pool("renew_session_lock")?;
         let now_ms = now_millis();
         let locked_until = offset_millis(now_ms, extend_for);
         let idle_ms = idle_timeout.as_millis().min(i64::MAX as u128) as i64;
@@ -1772,7 +1918,7 @@ impl Provider for MysqlProvider {
         query = query.bind(now_ms).bind(idle_cutoff);
 
         let res = query
-            .execute(&self.pool)
+            .execute(&pool)
             .await
             .map_err(|e| sqlx_to_provider_error("renew_session_lock", e))?;
 
@@ -1783,6 +1929,7 @@ impl Provider for MysqlProvider {
         &self,
         _idle_timeout: Duration,
     ) -> Result<usize, ProviderError> {
+        let pool = self.acquire_pool("cleanup_orphaned_sessions")?;
         let now_ms = now_millis();
         let sql = format!(
             "DELETE s FROM {} s \
@@ -1793,7 +1940,7 @@ impl Provider for MysqlProvider {
 
         let res = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(now_ms)
-            .execute(&self.pool)
+            .execute(&pool)
             .await
             .map_err(|e| sqlx_to_provider_error("cleanup_orphaned_sessions", e))?;
 
@@ -1809,6 +1956,7 @@ impl Provider for MysqlProvider {
         instance: &str,
         last_seen_version: u64,
     ) -> Result<Option<(Option<String>, u64)>, ProviderError> {
+        let pool = self.acquire_pool("get_custom_status")?;
         let sql = format!(
             "SELECT custom_status, custom_status_version FROM {} \
              WHERE instance_id = ? AND custom_status_version > ?",
@@ -1817,7 +1965,7 @@ impl Provider for MysqlProvider {
         let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(instance)
             .bind(last_seen_version as i64)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&pool)
             .await
             .map_err(|e| sqlx_to_provider_error("get_custom_status", e))?;
 
@@ -1836,6 +1984,7 @@ impl Provider for MysqlProvider {
         instance: &str,
         key: &str,
     ) -> Result<Option<String>, ProviderError> {
+        let pool = self.acquire_pool("get_kv_value")?;
         let delta_sql = format!(
             "SELECT value FROM {} WHERE instance_id = ? AND kv_key = ?",
             self.tables.kv_delta
@@ -1843,7 +1992,7 @@ impl Provider for MysqlProvider {
         if let Some(drow) = sqlx::query(sqlx::AssertSqlSafe(delta_sql.as_str()))
             .bind(instance)
             .bind(key)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&pool)
             .await
             .map_err(|e| sqlx_to_provider_error("get_kv_value", e))?
         {
@@ -1860,7 +2009,7 @@ impl Provider for MysqlProvider {
         let srow = sqlx::query(sqlx::AssertSqlSafe(store_sql.as_str()))
             .bind(instance)
             .bind(key)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&pool)
             .await
             .map_err(|e| sqlx_to_provider_error("get_kv_value", e))?;
 
@@ -1879,13 +2028,14 @@ impl Provider for MysqlProvider {
         &self,
         instance: &str,
     ) -> Result<HashMap<String, String>, ProviderError> {
+        let pool = self.acquire_pool("get_kv_all_values")?;
         let store_sql = format!(
             "SELECT kv_key, value FROM {} WHERE instance_id = ?",
             self.tables.kv_store
         );
         let store_rows = sqlx::query(sqlx::AssertSqlSafe(store_sql.as_str()))
             .bind(instance)
-            .fetch_all(&self.pool)
+            .fetch_all(&pool)
             .await
             .map_err(|e| sqlx_to_provider_error("get_kv_all_values", e))?;
 
@@ -1906,7 +2056,7 @@ impl Provider for MysqlProvider {
         );
         let delta_rows = sqlx::query(sqlx::AssertSqlSafe(delta_sql.as_str()))
             .bind(instance)
-            .fetch_all(&self.pool)
+            .fetch_all(&pool)
             .await
             .map_err(|e| sqlx_to_provider_error("get_kv_all_values", e))?;
 
@@ -1934,13 +2084,14 @@ impl Provider for MysqlProvider {
         &self,
         instance: &str,
     ) -> Result<Option<SystemStats>, ProviderError> {
+        let pool = self.acquire_pool("get_instance_stats")?;
         let inst_sql = format!(
             "SELECT current_execution_id FROM {} WHERE instance_id = ?",
             self.tables.instances
         );
         let Some(inst_row) = sqlx::query(sqlx::AssertSqlSafe(inst_sql.as_str()))
             .bind(instance)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&pool)
             .await
             .map_err(|e| sqlx_to_provider_error("get_instance_stats", e))?
         else {
@@ -1959,7 +2110,7 @@ impl Provider for MysqlProvider {
         let hist_row = sqlx::query(sqlx::AssertSqlSafe(hist_sql.as_str()))
             .bind(instance)
             .bind(exec_id)
-            .fetch_one(&self.pool)
+            .fetch_one(&pool)
             .await
             .map_err(|e| sqlx_to_provider_error("get_instance_stats", e))?;
 
@@ -1981,7 +2132,7 @@ impl Provider for MysqlProvider {
         let first_row = sqlx::query(sqlx::AssertSqlSafe(first_event_sql.as_str()))
             .bind(instance)
             .bind(exec_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&pool)
             .await
             .map_err(|e| sqlx_to_provider_error("get_instance_stats", e))?;
 
@@ -2017,7 +2168,7 @@ impl Provider for MysqlProvider {
     }
 }
 
-impl MysqlProvider {
+impl<P: PoolResolver> MysqlProvider<P> {
     #[allow(clippy::too_many_arguments)]
     async fn ack_orchestration_item_once(
         &self,
@@ -2030,8 +2181,8 @@ impl MysqlProvider {
         metadata: &ExecutionMetadata,
         cancelled_activities: &[ScheduledActivityIdentifier],
     ) -> Result<(), ProviderError> {
-        let mut tx = self
-            .pool
+        let pool = self.acquire_pool("ack_orchestration_item")?;
+        let mut tx = pool
             .begin()
             .await
             .map_err(|e| sqlx_to_provider_error("ack_orchestration_item", e))?;
@@ -2459,7 +2610,8 @@ impl MysqlProvider {
                 self.tables.orchestrator_queue
             );
             for item in orchestrator_items {
-                let Some(target_instance) = Self::extract_orchestrator_instance(item) else {
+                let Some(target_instance) = MysqlProvider::extract_orchestrator_instance(item)
+                else {
                     continue;
                 };
                 let raw = serde_json::to_string(item).map_err(|e| {
@@ -2511,5 +2663,138 @@ impl MysqlProvider {
             .map_err(|e| sqlx_to_provider_error("ack_orchestration_item", e))?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn from_pool_fn_resolves_pool_per_call_and_surfaces_retryable_errors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let closed_pool = MySqlPool::connect_lazy("mysql://localhost:1/duroxide")?;
+        closed_pool.close().await;
+
+        let current: Arc<Mutex<Option<MySqlPool>>> = Arc::new(Mutex::new(None));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let current_for_fn = Arc::clone(&current);
+        let calls_for_fn = Arc::clone(&calls);
+
+        let provider = MysqlProvider::from_pool_fn(
+            move || -> Result<MySqlPool, &'static str> {
+                calls_for_fn.fetch_add(1, Ordering::SeqCst);
+                current_for_fn
+                    .lock()
+                    .map_err(|_| "poisoned")?
+                    .clone()
+                    .ok_or("no live pool")
+            },
+            "dx_",
+            false,
+        )
+        .await?;
+
+        assert_eq!(provider.name(), "mysql-tidb");
+        assert!(format!("{provider:?}").contains("FnPoolResolver"));
+        let cloned = provider.clone();
+        let Some(admin) = cloned.as_management_capability() else {
+            panic!("expected management capability");
+        };
+
+        let Err(orch_err) = provider
+            .fetch_orchestration_item(Duration::from_secs(30), Duration::ZERO, None)
+            .await
+        else {
+            panic!("expected error when resolver has no pool");
+        };
+        assert!(orch_err.is_retryable(), "{orch_err}");
+        assert_eq!(orch_err.operation, "fetch_orchestration_item");
+        assert!(orch_err.message.contains("no live pool"), "{orch_err}");
+
+        let Err(work_err) = provider
+            .fetch_work_item(
+                Duration::from_secs(30),
+                Duration::ZERO,
+                None,
+                &TagFilter::DefaultOnly,
+            )
+            .await
+        else {
+            panic!("expected error when resolver has no pool");
+        };
+        assert!(work_err.is_retryable(), "{work_err}");
+        assert_eq!(work_err.operation, "fetch_work_item");
+
+        let Err(admin_err) = admin.get_queue_depths().await else {
+            panic!("expected admin error when resolver has no pool");
+        };
+        assert!(admin_err.is_retryable(), "{admin_err}");
+        assert_eq!(admin_err.operation, "get_queue_depths");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        // Swap in a closed pool: both Provider and ProviderAdmin must now hit the new pool.
+        if let Ok(mut guard) = current.lock() {
+            *guard = Some(closed_pool);
+        }
+        assert!(provider.resolve_pool().is_ok());
+
+        let Err(read_err) = provider.read("inst-1").await else {
+            panic!("expected closed-pool error on read");
+        };
+        assert!(read_err.is_retryable(), "{read_err}");
+        assert!(read_err.message.contains("closed pool"), "{read_err}");
+
+        let Err(admin_closed_err) = admin.get_queue_depths().await else {
+            panic!("expected closed-pool error on get_queue_depths");
+        };
+        assert!(admin_closed_err.is_retryable(), "{admin_closed_err}");
+        assert!(
+            admin_closed_err.message.contains("closed pool"),
+            "{admin_closed_err}"
+        );
+
+        // Removing the pool proves the provider never cached the previous pool clone.
+        if let Ok(mut guard) = current.lock() {
+            *guard = None;
+        }
+        let Err(removed_err) = provider.read("inst-1").await else {
+            panic!("expected resolver error after pool removal");
+        };
+        assert!(removed_err.is_retryable(), "{removed_err}");
+        assert!(
+            removed_err.message.contains("no live pool"),
+            "{removed_err}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 7);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn from_pool_fn_validates_prefix_and_migration_resolver_errors() {
+        let bad_prefix = MysqlProvider::from_pool_fn(
+            || -> Result<MySqlPool, &'static str> { Err("unused") },
+            "bad-prefix!",
+            false,
+        )
+        .await;
+        assert!(matches!(bad_prefix, Err(InitError::InvalidConfig(_))));
+
+        let migrate_err = MysqlProvider::from_pool_fn(
+            || -> Result<MySqlPool, &'static str> { Err("resolver unavailable") },
+            "dx_",
+            true,
+        )
+        .await;
+        match migrate_err {
+            Err(InitError::InvalidConfig(msg)) => {
+                assert!(msg.contains("resolver unavailable"), "{msg}");
+            }
+            other => panic!("expected InvalidConfig on auto_migrate resolver failure: {other:?}"),
+        }
     }
 }

@@ -68,6 +68,6 @@ pub use duroxide;
 pub use error::{InitError, SqlErrorClass, classify_mysql_code};
 #[cfg(feature = "memory")]
 pub use memory::MemoryProvider;
-pub use provider::MysqlProvider;
+pub use provider::{FnPoolResolver, MysqlProvider, PoolResolver};
 pub use schema::{schema_ddl, schema_statements, validate_table_prefix};
 pub use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlSslMode};

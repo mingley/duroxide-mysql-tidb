@@ -8,19 +8,20 @@ use duroxide::providers::{
 use sqlx::Row;
 
 use crate::error::sqlx_to_provider_error;
-use crate::provider::MysqlProvider;
+use crate::provider::{MysqlProvider, PoolResolver};
 
 const DEFAULT_BULK_LIMIT: u32 = 1_000;
 
 #[async_trait::async_trait]
-impl ProviderAdmin for MysqlProvider {
+impl<P: PoolResolver> ProviderAdmin for MysqlProvider<P> {
     async fn list_instances(&self) -> Result<Vec<String>, ProviderError> {
+        let pool = self.acquire_pool("list_instances")?;
         let sql = format!(
             "SELECT instance_id FROM {} ORDER BY created_at DESC, seq_id DESC",
             self.tables.instances
         );
         let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
-            .fetch_all(&self.pool)
+            .fetch_all(&pool)
             .await
             .map_err(|e| sqlx_to_provider_error("list_instances", e))?;
 
@@ -31,6 +32,7 @@ impl ProviderAdmin for MysqlProvider {
     }
 
     async fn list_instances_by_status(&self, status: &str) -> Result<Vec<String>, ProviderError> {
+        let pool = self.acquire_pool("list_instances_by_status")?;
         let sql = format!(
             "SELECT i.instance_id \
              FROM {} i \
@@ -41,7 +43,7 @@ impl ProviderAdmin for MysqlProvider {
         );
         let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(status)
-            .fetch_all(&self.pool)
+            .fetch_all(&pool)
             .await
             .map_err(|e| sqlx_to_provider_error("list_instances_by_status", e))?;
 
@@ -52,13 +54,14 @@ impl ProviderAdmin for MysqlProvider {
     }
 
     async fn list_executions(&self, instance: &str) -> Result<Vec<u64>, ProviderError> {
+        let pool = self.acquire_pool("list_executions")?;
         let sql = format!(
             "SELECT execution_id FROM {} WHERE instance_id = ? ORDER BY execution_id ASC",
             self.tables.executions
         );
         let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(instance)
-            .fetch_all(&self.pool)
+            .fetch_all(&pool)
             .await
             .map_err(|e| sqlx_to_provider_error("list_executions", e))?;
 
@@ -86,13 +89,14 @@ impl ProviderAdmin for MysqlProvider {
     }
 
     async fn latest_execution_id(&self, instance: &str) -> Result<u64, ProviderError> {
+        let pool = self.acquire_pool("latest_execution_id")?;
         let sql = format!(
             "SELECT COALESCE(MAX(execution_id), 1) AS max_exec FROM {} WHERE instance_id = ?",
             self.tables.executions
         );
         let max_exec: i64 = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(instance)
-            .fetch_one(&self.pool)
+            .fetch_one(&pool)
             .await
             .map_err(|e| sqlx_to_provider_error("latest_execution_id", e))?;
 
@@ -100,6 +104,7 @@ impl ProviderAdmin for MysqlProvider {
     }
 
     async fn get_instance_info(&self, instance: &str) -> Result<InstanceInfo, ProviderError> {
+        let pool = self.acquire_pool("get_instance_info")?;
         let sql = format!(
             "SELECT \
                 i.instance_id, \
@@ -119,7 +124,7 @@ impl ProviderAdmin for MysqlProvider {
 
         let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(instance)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&pool)
             .await
             .map_err(|e| sqlx_to_provider_error("get_instance_info", e))?;
 
@@ -170,6 +175,7 @@ impl ProviderAdmin for MysqlProvider {
         instance: &str,
         execution_id: u64,
     ) -> Result<ExecutionInfo, ProviderError> {
+        let pool = self.acquire_pool("get_execution_info")?;
         let sql = format!(
             "SELECT \
                 e.execution_id, \
@@ -188,7 +194,7 @@ impl ProviderAdmin for MysqlProvider {
         let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(instance)
             .bind(execution_id as i64)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&pool)
             .await
             .map_err(|e| sqlx_to_provider_error("get_execution_info", e))?;
 
@@ -221,6 +227,7 @@ impl ProviderAdmin for MysqlProvider {
     }
 
     async fn get_system_metrics(&self) -> Result<SystemMetrics, ProviderError> {
+        let pool = self.acquire_pool("get_system_metrics")?;
         let inst_sql = format!(
             "SELECT \
                 COUNT(*) AS total_instances, \
@@ -233,7 +240,7 @@ impl ProviderAdmin for MysqlProvider {
         );
 
         let row = sqlx::query(sqlx::AssertSqlSafe(inst_sql.as_str()))
-            .fetch_one(&self.pool)
+            .fetch_one(&pool)
             .await
             .map_err(|e| sqlx_to_provider_error("get_system_metrics", e))?;
 
@@ -245,13 +252,13 @@ impl ProviderAdmin for MysqlProvider {
         let total_exec_sql = format!("SELECT COUNT(*) FROM {}", self.tables.executions);
         let total_executions: i64 =
             sqlx::query_scalar(sqlx::AssertSqlSafe(total_exec_sql.as_str()))
-                .fetch_one(&self.pool)
+                .fetch_one(&pool)
                 .await
                 .map_err(|e| sqlx_to_provider_error("get_system_metrics", e))?;
 
         let total_events_sql = format!("SELECT COUNT(*) FROM {}", self.tables.history);
         let total_events: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(total_events_sql.as_str()))
-            .fetch_one(&self.pool)
+            .fetch_one(&pool)
             .await
             .map_err(|e| sqlx_to_provider_error("get_system_metrics", e))?;
 
@@ -266,12 +273,13 @@ impl ProviderAdmin for MysqlProvider {
     }
 
     async fn get_queue_depths(&self) -> Result<QueueDepths, ProviderError> {
+        let pool = self.acquire_pool("get_queue_depths")?;
         let oq_sql = format!(
             "SELECT COUNT(*) FROM {} WHERE lock_token IS NULL",
             self.tables.orchestrator_queue
         );
         let oq: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(oq_sql.as_str()))
-            .fetch_one(&self.pool)
+            .fetch_one(&pool)
             .await
             .map_err(|e| sqlx_to_provider_error("get_queue_depths", e))?;
 
@@ -280,7 +288,7 @@ impl ProviderAdmin for MysqlProvider {
             self.tables.worker_queue
         );
         let wq: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(wq_sql.as_str()))
-            .fetch_one(&self.pool)
+            .fetch_one(&pool)
             .await
             .map_err(|e| sqlx_to_provider_error("get_queue_depths", e))?;
 
@@ -292,13 +300,14 @@ impl ProviderAdmin for MysqlProvider {
     }
 
     async fn list_children(&self, instance_id: &str) -> Result<Vec<String>, ProviderError> {
+        let pool = self.acquire_pool("list_children")?;
         let sql = format!(
             "SELECT instance_id FROM {} WHERE parent_instance_id = ? ORDER BY seq_id ASC",
             self.tables.instances
         );
         let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(instance_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&pool)
             .await
             .map_err(|e| sqlx_to_provider_error("list_children", e))?;
 
@@ -309,13 +318,14 @@ impl ProviderAdmin for MysqlProvider {
     }
 
     async fn get_parent_id(&self, instance_id: &str) -> Result<Option<String>, ProviderError> {
+        let pool = self.acquire_pool("get_parent_id")?;
         let sql = format!(
             "SELECT parent_instance_id FROM {} WHERE instance_id = ?",
             self.tables.instances
         );
         let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(instance_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&pool)
             .await
             .map_err(|e| sqlx_to_provider_error("get_parent_id", e))?;
 
@@ -343,8 +353,8 @@ impl ProviderAdmin for MysqlProvider {
         sorted_ids.dedup();
         let placeholders = vec!["?"; sorted_ids.len()].join(", ");
 
-        let mut tx = self
-            .pool
+        let pool = self.acquire_pool("delete_instances_atomic")?;
+        let mut tx = pool
             .begin()
             .await
             .map_err(|e| sqlx_to_provider_error("delete_instances_atomic", e))?;
@@ -585,8 +595,9 @@ impl ProviderAdmin for MysqlProvider {
         }
         query = query.bind(limit);
 
+        let pool = self.acquire_pool("delete_instance_bulk")?;
         let rows = query
-            .fetch_all(&self.pool)
+            .fetch_all(&pool)
             .await
             .map_err(|e| sqlx_to_provider_error("delete_instance_bulk", e))?;
 
@@ -613,8 +624,8 @@ impl ProviderAdmin for MysqlProvider {
         instance_id: &str,
         options: PruneOptions,
     ) -> Result<PruneResult, ProviderError> {
-        let mut tx = self
-            .pool
+        let pool = self.acquire_pool("prune_executions")?;
+        let mut tx = pool
             .begin()
             .await
             .map_err(|e| sqlx_to_provider_error("prune_executions", e))?;
@@ -764,8 +775,9 @@ impl ProviderAdmin for MysqlProvider {
         }
         query = query.bind(limit);
 
+        let pool = self.acquire_pool("prune_executions_bulk")?;
         let rows = query
-            .fetch_all(&self.pool)
+            .fetch_all(&pool)
             .await
             .map_err(|e| sqlx_to_provider_error("prune_executions_bulk", e))?;
 

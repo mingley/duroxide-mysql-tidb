@@ -313,3 +313,106 @@ async fn lock_renewal_fetch_ack_abandon_contention_no_deadlocks() {
 
     factory.finish().await;
 }
+
+#[tokio::test]
+async fn pool_resolver_fails_over_after_old_pool_closes() {
+    let Some(url) = test_database_url() else {
+        return;
+    };
+
+    let pool_a = new_test_pool(&url).await;
+    let pool_b = new_test_pool(&url).await;
+    let rand_id = uuid::Uuid::new_v4().simple().to_string();
+    let prefix = format!("pr_{}_", &rand_id[..12]);
+
+    let active_pool = Arc::new(std::sync::Mutex::new(pool_a.clone()));
+    let active_for_resolver = Arc::clone(&active_pool);
+    let store: Arc<dyn Provider> = Arc::new(
+        MysqlProvider::from_pool_fn(
+            move || -> Result<duroxide_mysql_tidb::MySqlPool, &'static str> {
+                Ok(active_for_resolver.lock().unwrap().clone())
+            },
+            &prefix,
+            true,
+        )
+        .await
+        .unwrap(),
+    );
+
+    let activities = ActivityRegistry::builder()
+        .register("Echo", |_ctx: ActivityContext, input: String| async move {
+            Ok(format!("echo:{input}"))
+        })
+        .build();
+
+    let orchestrations = OrchestrationRegistry::builder()
+        .register(
+            "EchoFlow",
+            |ctx: OrchestrationContext, input: String| async move {
+                ctx.schedule_activity("Echo", input).await
+            },
+        )
+        .build();
+
+    let rt = runtime::Runtime::start_with_options(
+        store.clone(),
+        activities,
+        orchestrations,
+        RuntimeOptions {
+            dispatcher_min_poll_interval: Duration::from_millis(10),
+            ..RuntimeOptions::default()
+        },
+    )
+    .await;
+    let client = Client::new(store);
+
+    client
+        .start_orchestration("failover-1", "EchoFlow", "before")
+        .await
+        .unwrap();
+    match client
+        .wait_for_orchestration("failover-1", Duration::from_secs(10))
+        .await
+        .unwrap()
+    {
+        OrchestrationStatus::Completed { output, .. } => assert_eq!(output, "echo:before"),
+        other => panic!("unexpected status before failover: {other:?}"),
+    }
+
+    // Rotate to pool_b and close pool_a to simulate an SRV target leaving rotation.
+    *active_pool.lock().unwrap() = pool_b.clone();
+    pool_a.close().await;
+
+    client
+        .start_orchestration("failover-2", "EchoFlow", "after")
+        .await
+        .unwrap();
+    match client
+        .wait_for_orchestration("failover-2", Duration::from_secs(10))
+        .await
+        .unwrap()
+    {
+        OrchestrationStatus::Completed { output, .. } => assert_eq!(output, "echo:after"),
+        other => panic!("unexpected status after failover: {other:?}"),
+    }
+
+    rt.shutdown(None).await;
+
+    for suffix in [
+        "instance_locks",
+        "orchestrator_queue",
+        "worker_queue",
+        "sessions",
+        "kv_delta",
+        "kv_store",
+        "history",
+        "executions",
+        "instances",
+    ] {
+        let sql = format!("DROP TABLE IF EXISTS `{prefix}{suffix}`");
+        let _ = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .execute(&pool_b)
+            .await;
+    }
+    pool_b.close().await;
+}
